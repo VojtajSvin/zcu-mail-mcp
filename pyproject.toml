@@ -1,0 +1,13 @@
+[project]
+name = "zcu-mail-mcp"
+version = "0.1.0"
+description = "MCP server k poště ZČU (webmail.zcu.cz) přes Exchange ActiveSync"
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.3,<3"]
+
+[project.scripts]
+zcu-mail-mcp = "zcu_mail_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
