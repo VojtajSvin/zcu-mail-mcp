@@ -100,9 +100,9 @@ def main():
         seen = any(x["id"] == mid for x in c.list_messages("drafts", 1, 50, False)["messages"])
         return f"id {mid}, v Konceptech {'je' if seen else 'NENÍ vidět'}"
 
-    def wait_inbox(n):
+    def wait_inbox(needle, n):  # jen zprávy tohoto běhu: předmět obsahuje čas odeslání
         for _ in range(15):
-            hits = [m for m in inbox(1) if MARK in m["subject"]]
+            hits = [m for m in inbox(1) if needle in m["subject"]]
             if len(hits) >= n:
                 return hits
             time.sleep(3)
@@ -111,7 +111,7 @@ def main():
     def send():
         subject = f"{MARK} žluťoučký kůň {time.strftime('%H:%M:%S')}"
         c.send([me], subject, "Zkušební zpráva: Příliš žluťoučký kůň úpěl ďábelské ódy.")
-        s["sent"] = wait_inbox(1)[0]
+        s["sent"] = wait_inbox(subject, 1)[0]
         in_sent = any(MARK in m["subject"] for m in c.list_messages("sent", 1, 50, False)["messages"])
         return f"dorazila, předmět s diakritikou {'sedí' if s['sent']['subject'] == subject else 'SE ZMĚNIL'}, " \
                f"kopie v Odeslané poště {'je' if in_sent else 'NENÍ'}"
@@ -121,7 +121,7 @@ def main():
         to, cc = c.reply_recipients(orig, True)
         c.reply(orig["id"], "Zkušební odpověď.", to, cc, "Re: " + orig["subject"])
         c.forward(orig["id"], [me], "Zkušební přeposlání.", "Fwd: " + orig["subject"])
-        wait_inbox(3)
+        wait_inbox(orig["subject"], 3)  # původní, Re: a Fwd:
         return f"odpověď (komu {len(to)}, kopie {len(cc)}) i přeposlání dorazily"
 
     def cleanup():
