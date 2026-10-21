@@ -15,7 +15,7 @@ from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from .eas import Client, EasError
+from .eas import Client, EasError, load_attachments
 
 
 def skip_confirmation() -> bool:
@@ -53,6 +53,10 @@ Folder = Annotated[str, Field(description="Složka: inbox, drafts, sent, trash (
                                           "odeslaná pošta, koš), nebo název, cesta či id z list_folders.")]
 Addresses = Annotated[list[str], Field(min_length=1, description="Adresy, např. „jan@zcu.cz“ nebo „Jan Novák <jan@zcu.cz>“.")]
 Cc = Annotated[list[str] | None, Field(description="Kopie (Cc). Skrytou kopii (Bcc) server neumí.")]
+Attachments = Annotated[list[str] | None, Field(description=(
+    "Absolutní cesty k souborům na počítači, kde běží server. Odešlou se jako MIME přílohy "
+    "(správný typ, jméno s diakritikou). Dohromady nejvýše 25 MB. Bez nich se nic nemění."
+))]
 Token = Annotated[str, Field(description=(
     "Ignoruje se. ZCU_SKIP_CONFIRMATION je zapnuté a akce se provede hned. Parametr zůstává kvůli starším klientům."
     if _SKIP else
@@ -110,6 +114,10 @@ async def confirmed(ctx: Context, preview: str, token: str, *action) -> dict | N
 
 def _lines(**fields) -> str:
     return "\n".join(f"{k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in fields.items() if v)
+
+
+def _attach_line(loaded) -> str:
+    return ", ".join(f"{name} ({len(data)} B)" for name, _, data in loaded)
 
 
 # --- čtení ---
@@ -181,12 +189,17 @@ def get_attachment(
 
 @mcp.tool(title="Uložit koncept",
           annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
-def save_draft(to: Addresses, subject: str, body: str, cc: Cc = None) -> dict:
-    """Uloží koncept do složky Koncepty, nic neodesílá. Uživatel ho dopíše a odešle ve webmailu,
-    nebo ho odešle send_message."""
+def save_draft(to: Addresses, subject: str, body: str, cc: Cc = None, attachments: Attachments = None) -> dict:
+    """Uloží koncept do složky Koncepty, nic neodesílá. attachments jsou absolutní cesty k souborům
+    na počítači, kde běží server; uloží se jako přílohy konceptu. Dohromady nejvýše 25 MB.
+    Uživatel ho dopíše a odešle ve webmailu, nebo ho odešle send_message."""
+    loaded = load_attachments(attachments)  # chybná cesta se hlásí dřív než chybějící přihlášení
     c = client()
-    mid = c.save_draft(to, subject, body, cc or [])
-    return {"status": "uloženo", "id": mid, "folder": c.folder_path(mid.rpartition("+")[0])}
+    mid = c.save_draft(to, subject, body, cc or [], loaded)
+    out = {"status": "uloženo", "id": mid, "folder": c.folder_path(mid.rpartition("+")[0])}
+    if loaded:
+        out["attachments"] = [name for name, _, _ in loaded]
+    return out
 
 
 @mcp.tool(title="Označit zprávu",
@@ -202,33 +215,51 @@ def mark_message(message_id: MessageId, read: bool | None = None, flagged: bool 
 # --- s potvrzením ---
 
 @mcp.tool(title="Odeslat e-mail", annotations=SEND, description=_confirm_description(
-    "Odešle nový e-mail z adresy uživatele a uloží ho do Odeslané pošty."))
+    "Odešle nový e-mail z adresy uživatele a uloží ho do Odeslané pošty. attachments jsou absolutní cesty "
+    "k souborům na počítači, kde běží server; odejdou jako přílohy a jsou i v kopii v Odeslané poště. "
+    "Dohromady nejvýše 25 MB."))
 async def send_message(to: Addresses, subject: str, body: str, ctx: Context, cc: Cc = None,
-                       confirmation_token: Token = "") -> dict:
-    """Odešle nový e-mail z adresy uživatele a uloží ho do Odeslané pošty. Vyžaduje potvrzení uživatelem."""
-    cc = cc or []
-    preview = "Odeslat e-mail\n" + _lines(Komu=to, Kopie=cc, Předmět=subject) + f"\n\n{body}"
-    if stop := await confirmed(ctx, preview, confirmation_token, "send", to, cc, subject, body):
+                       confirmation_token: Token = "", attachments: Attachments = None) -> dict:
+    """Odešle nový e-mail z adresy uživatele a uloží ho do Odeslané pošty. attachments jsou absolutní cesty
+    k souborům na počítači, kde běží server; odejdou jako přílohy a jsou i v kopii v Odeslané poště.
+    Dohromady nejvýše 25 MB. Vyžaduje potvrzení uživatelem."""
+    cc, files = cc or [], list(attachments or [])
+    loaded = await asyncio.to_thread(load_attachments, files)
+    preview = "Odeslat e-mail\n" + _lines(Komu=to, Kopie=cc, Předmět=subject, Přílohy=_attach_line(loaded)) + f"\n\n{body}"
+    if stop := await confirmed(ctx, preview, confirmation_token, "send", to, cc, subject, body, files):
         return stop
-    await asyncio.to_thread(client().send, to, subject, body, cc)
-    return {"status": "odesláno", "to": to, "cc": cc, "subject": subject}
+    await asyncio.to_thread(client().send, to, subject, body, cc, loaded)
+    out = {"status": "odesláno", "to": to, "cc": cc, "subject": subject}
+    if loaded:
+        out["attachments"] = [name for name, _, _ in loaded]
+    return out
 
 
 @mcp.tool(title="Odpovědět", annotations=SEND, description=_confirm_description(
-    "Odpoví na zprávu, původní text připojí pod odpověď. reply_all přidá do kopie ostatní příjemce."))
+    "Odpoví na zprávu, původní text připojí pod odpověď a zachová vlákno (In-Reply-To, References). "
+    "reply_all přidá do kopie ostatní příjemce. attachments jsou absolutní cesty k souborům na počítači, "
+    "kde běží server; odejdou jako přílohy a jsou i v kopii v Odeslané poště. Dohromady nejvýše 25 MB."))
 async def reply_message(message_id: MessageId, body: str, ctx: Context, reply_all: bool = False,
-                        confirmation_token: Token = "") -> dict:
-    """Odpoví na zprávu, původní text připojí pod odpověď. reply_all přidá do kopie ostatní příjemce.
+                        confirmation_token: Token = "", attachments: Attachments = None) -> dict:
+    """Odpoví na zprávu, původní text připojí pod odpověď a zachová vlákno (In-Reply-To, References).
+    reply_all přidá do kopie ostatní příjemce. attachments jsou absolutní cesty k souborům na počítači,
+    kde běží server; odejdou jako přílohy a jsou i v kopii v Odeslané poště. Dohromady nejvýše 25 MB.
     Vyžaduje potvrzení uživatelem."""
+    files = list(attachments or [])
+    loaded = await asyncio.to_thread(load_attachments, files)
     c = client()
     original = await asyncio.to_thread(c.read, message_id, 0)
     to, cc = await asyncio.to_thread(c.reply_recipients, original, reply_all)
     subject = original["subject"] if original["subject"].lower().startswith("re:") else f"Re: {original['subject']}"
-    preview = "Odpovědět\n" + _lines(Komu=to, Kopie=cc, Předmět=subject) + f"\n\n{body}\n\n(pod textem bude původní zpráva)"
-    if stop := await confirmed(ctx, preview, confirmation_token, "reply", message_id, body, reply_all):
+    preview = ("Odpovědět\n" + _lines(Komu=to, Kopie=cc, Předmět=subject, Přílohy=_attach_line(loaded))
+               + f"\n\n{body}\n\n(pod textem bude původní zpráva)")
+    if stop := await confirmed(ctx, preview, confirmation_token, "reply", message_id, body, reply_all, files):
         return stop
-    await asyncio.to_thread(c.reply, message_id, body, to, cc, subject)
-    return {"status": "odesláno", "to": to, "cc": cc, "subject": subject}
+    await asyncio.to_thread(c.reply, message_id, body, to, cc, subject, loaded)
+    out = {"status": "odesláno", "to": to, "cc": cc, "subject": subject}
+    if loaded:
+        out["attachments"] = [name for name, _, _ in loaded]
+    return out
 
 
 @mcp.tool(title="Přeposlat", annotations=SEND, description=_confirm_description(
