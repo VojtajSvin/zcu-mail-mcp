@@ -1,11 +1,15 @@
-"""Offline test MCP serveru přes stdio: nástroje, anotace a potvrzování. Síť ani heslo nepotřebuje.
+"""Offline test MCP serveru přes stdio: nástroje, anotace, potvrzování a MIME příloh. Síť ani heslo nepotřebuje.
 
 Spuštění: python test_offline.py (v prostředí, kde je nainstalovaný tento balíček).
 """
 import asyncio
+import email
+import email.policy
 import json
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
@@ -60,6 +64,14 @@ async def without_elicitation(s):
         print(f"  {t.name:16} read_only={a.read_only_hint!s:5} destructive={a.destructive_hint}")
     assert all(tools[n].annotations.read_only_hint for n in ("list_folders", "list_messages", "search_messages", "read_message"))
     assert all(tools[n].annotations.destructive_hint for n in ("send_message", "reply_message", "forward_message", "move_message"))
+    for name in ("send_message", "reply_message", "save_draft"):
+        schema = tools[name].input_schema
+        prop = schema["properties"]["attachments"]
+        assert "Absolutní" in prop["description"] and "25 MB" in prop["description"], prop
+        assert "attachments" not in schema.get("required", [])
+    assert "příloh" in (tools["send_message"].description or "")
+    assert "In-Reply-To" in (tools["reply_message"].description or "")
+    assert "příloh" in (tools["save_draft"].description or "")
 
     r = await s.call_tool("list_folders", {})
     assert r.is_error and NO_CREDS in text(r), text(r)
@@ -138,9 +150,174 @@ async def expect_direct(s):
     assert r.is_error and NO_CREDS in text(r) and "zrušeno" not in text(r), text(r)
 
 
+def check_mime():
+    import zcu_mail_mcp.eas as eas
+    from zcu_mail_mcp.eas import (
+        ATTACHMENT_LIMIT, EasError, build_mime, compose_request, content_type, encode, load_attachments,
+        parse_original, quote_original, threading_headers,
+    )
+
+    plain = build_mime(["Jan Novák <jan@zcu.cz>"], "Žluťoučký kůň", "Příliš úpěl ďábelské ódy.")
+    assert plain.decode("ascii")
+    parsed = email.message_from_bytes(plain, policy=email.policy.default)
+    assert parsed.get_content_type() == "text/plain" and not parsed.is_multipart()
+    assert parsed.get_content().strip() == "Příliš úpěl ďábelské ódy."
+    assert parsed.get("In-Reply-To") is None and "filename" not in plain.decode("ascii").lower()
+    empty = build_mime(["a@zcu.cz"], "A", "b", attachments=[])
+    assert not email.message_from_bytes(empty, policy=email.policy.default).is_multipart()
+
+    name = "žluťoučký kůň.docx"
+    payload = b"PK\x03\x04prijem"
+    ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    parent = "<puvodni@zcu.cz>"
+    earlier = " ".join(f"<{i}@zcu.cz>" for i in range(10))
+    in_reply_to, references = threading_headers(parent, earlier)
+    assert in_reply_to == parent and references.split()[1] == "<2@zcu.cz>" and references.endswith(parent)
+    assert "<1@zcu.cz>" not in references.split()
+    original = {"from": "Jan Novák <jan@zcu.cz>", "date": "Mon, 1 Jan 2024 00:00:00 +0000",
+                "subject": "Otázka", "body": "Původní věta.\n\nDruhý odstavec."}
+    body = quote_original("Moje odpověď: příliš.", original)
+    raw = build_mime(["jan@zcu.cz"], "Re: Otázka", body, ["kopie@zcu.cz"], [(name, ctype, payload)],
+                     in_reply_to=in_reply_to, references=references)
+    assert raw.decode("ascii") and name.encode() not in raw
+    assert b"filename*=utf-8''" in raw or b"filename*0*=utf-8''" in raw
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    assert msg["In-Reply-To"] == parent and parent in msg["References"]
+    text_part = msg.get_body(preferencelist=("plain",))
+    text = text_part.get_content()
+    assert "Moje odpověď: příliš." in text and "> Původní věta." in text and "> Druhý odstavec." in text
+    atts = list(msg.iter_attachments())
+    assert len(atts) == 1
+    assert atts[0].get_filename() == name
+    assert atts[0].get_content_type() == ctype
+    assert atts[0].get_content_disposition() == "attachment"
+    assert atts[0].get_content() == payload
+
+    # Koncept ukládá totéž MIME jako text do WBXML. Diakritika ve jméně musí přežít tam i zpět.
+    tree = decode_roundtrip(raw)
+    assert tree == raw.decode("ascii")
+
+    html_mail = (
+        b"From: Eva <eva@zcu.cz>\r\nMessage-ID: <h@zcu.cz>\r\n"
+        b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n"
+        b"Content-Transfer-Encoding: quoted-printable\r\n\r\n<p>Ahoj<br>sv=C4=9Bte</p>\r\n"
+    )
+    info = parse_original(html_mail)
+    assert info["message_id"] == "<h@zcu.cz>" and "Ahoj" in info["body"] and "světe" in info["body"]
+    assert "<p>" not in info["body"]
+
+    req = compose_request("SendMail", plain, client_id="abc")
+    assert [part if isinstance(part, str) else part[0] for part in req] == [
+        "ComposeMail:SendMail", "ClientId", "SaveInSentItems", "MIME"]
+    assert ["ReplaceMime"] not in req and req[-1][1] == plain
+    reply = compose_request("SmartReply", raw, "slozka+12", True, "abc")
+    assert ["Source", ["FolderId", "slozka"], ["ItemId", "12"]] in reply
+    assert ["ReplaceMime"] in reply and ["SaveInSentItems"] in reply and reply[-1][1] == raw
+    bare = compose_request("SmartReply", plain, "slozka+12", False, "abc")
+    assert ["ReplaceMime"] not in bare and ["SaveInSentItems"] in bare
+    encode(["ItemOperations:ItemOperations", ["Fetch", ["Store", "Mailbox"], ["Options",
+            ["AirSyncBase:BodyPreference", ["Type", "4"], ["TruncationSize", "2000000"]],
+            ["AirSync:MIMESupport", "2"]]]])
+
+    folder = tempfile.mkdtemp(prefix="zcu-mail-")
+    try:
+        doc = Path(folder) / name
+        doc.write_bytes(payload)
+        other = Path(folder) / "druha.txt"
+        other.write_bytes(b"abc")
+        loaded = load_attachments([str(doc), str(other)])
+        assert loaded[0] == (name, ctype, payload)
+        assert loaded[1][0] == "druha.txt" and loaded[1][1] == "text/plain" and loaded[1][2] == b"abc"
+        assert content_type("soubor.docx") == ctype
+        assert content_type("soubor.neznamyxxx") == "application/octet-stream"
+        assert load_attachments(None) == [] and load_attachments([]) == []
+
+        missing = str(Path(folder) / "neni-žluťoučký.docx")
+        for bad, needle in (
+            (missing, "neexistuje"),
+            ("relativni.docx", "není absolutní"),
+            (folder, "není soubor"),
+        ):
+            try:
+                load_attachments([bad])
+            except EasError as e:
+                assert needle in str(e) and (bad in str(e) or needle == "není absolutní"), e
+            else:
+                raise AssertionError(bad)
+
+        old = eas.ATTACHMENT_LIMIT
+        eas.ATTACHMENT_LIMIT = 8
+        try:
+            exact = Path(folder) / "presne.bin"
+            exact.write_bytes(b"12345678")
+            assert len(load_attachments([str(exact)])[0][2]) == 8
+            over = Path(folder) / "pres.bin"
+            over.write_bytes(b"123456789")
+            try:
+                load_attachments([str(over)])
+            except EasError as e:
+                assert "25 MB" in str(e) and str(eas.ATTACHMENT_LIMIT) in str(e)
+            else:
+                raise AssertionError("limit")
+            a, b = Path(folder) / "a.bin", Path(folder) / "b.bin"
+            a.write_bytes(b"12345")
+            b.write_bytes(b"1234")
+            try:
+                load_attachments([str(a), str(b)])
+            except EasError as e:
+                assert "dohromady" in str(e)
+            else:
+                raise AssertionError("součet")
+        finally:
+            eas.ATTACHMENT_LIMIT = old
+        assert ATTACHMENT_LIMIT == 25 * 1024 * 1024
+    finally:
+        shutil.rmtree(folder)
+    print("  MIME přílohy, diakritika, citace a limit OK")
+
+
+def decode_roundtrip(raw: bytes) -> str:
+    from zcu_mail_mcp.eas import decode, encode
+
+    mime = raw.decode("ascii")
+    decoded = decode(encode(["AirSync:Sync", ["AirSyncBase:Body", ["Type", "4"], ["Data", mime]]]))
+    return decoded[0][1][2][1]
+
+
+async def attachment_paths(s):
+    missing = "/tmp/zcu-mail-mcp-chybi-žluťoučký.docx"
+    r = await s.call_tool("send_message", {"to": ["jan@zcu.cz"], "subject": "A", "body": "b", "attachments": [missing]})
+    assert r.is_error and "neexistuje" in text(r) and missing in text(r), text(r)
+    r = await s.call_tool("save_draft", {"to": ["jan@zcu.cz"], "subject": "A", "body": "b", "attachments": ["relativni.docx"]})
+    assert r.is_error and "absolutní" in text(r) and NO_CREDS not in text(r), text(r)
+    r = await s.call_tool("reply_message", {"message_id": "inbox+1", "body": "b", "attachments": ["/tmp"]})
+    assert r.is_error and "není soubor" in text(r), text(r)
+
+    folder = tempfile.mkdtemp(prefix="zcu-mail-")
+    try:
+        first = Path(folder) / "žluťoučký kůň.docx"
+        second = Path(folder) / "druhy.txt"
+        first.write_bytes(b"PK\x03\x04")
+        second.write_bytes(b"abc")
+        args = {"to": ["jan@zcu.cz"], "subject": "Ahoj", "body": "text", "attachments": [str(first)]}
+        r = await s.call_tool("send_message", args)
+        preview = data(r)
+        assert preview["status"].startswith("NÁHLED") and "žluťoučký kůň.docx (4 B)" in preview["preview"], preview
+        token = preview["confirmation_token"]
+        r = await s.call_tool("send_message", {**args, "attachments": [str(second)], "confirmation_token": token})
+        assert data(r)["status"].startswith("NÁHLED") and "nepatří" in data(r)["next"], r
+        r = await s.call_tool("send_message", {**args, "confirmation_token": token})
+        assert r.is_error and NO_CREDS in text(r), text(r)
+    finally:
+        shutil.rmtree(folder)
+    print("  přílohy: chybná cesta, náhled a token OK")
+
+
 async def main():
+    check_mime()
     check_parser()
     await session(check=without_elicitation)
+    await session(check=attachment_paths)
     await session(answering("decline"), declined)
     await session(answering("accept", False), declined)
     await session(answering("accept", True), accepted)

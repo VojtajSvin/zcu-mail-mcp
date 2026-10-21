@@ -13,10 +13,10 @@ takže stačí obyčejný webový provoz (HTTPS), IMAP ani SMTP nepotřebuje.
 | `search_messages` | hledání v předmětu a odesílateli | – |
 | `read_message` | celá zpráva s přílohami | – |
 | `get_attachment` | uloží přílohu do `~/zcu-mail-prilohy`, text a obrázky vrátí i přímo | – |
-| `save_draft` | uloží koncept do Konceptů | – |
+| `save_draft` | uloží koncept do Konceptů, volitelně s přílohami | – |
 | `mark_message` | přečteno / nepřečteno, příznak | – |
-| `send_message` | odešle nový e-mail | ano |
-| `reply_message` | odpoví (i všem) | ano |
+| `send_message` | odešle nový e-mail, volitelně s přílohami | ano |
+| `reply_message` | odpoví (i všem), volitelně s přílohami | ano |
 | `forward_message` | přepošle i s přílohami | ano |
 | `move_message` | přesune, smazání = přesun do koše | ano |
 
@@ -70,16 +70,31 @@ Totéž jako konfigurace MCP klienta:
 }
 ```
 
+## Přílohy
+
+`send_message`, `reply_message` a `save_draft` berou volitelný parametr `attachments`: seznam absolutních cest
+k souborům na počítači, kde běží server, třeba `/home/user/žluťoučký dopis.docx`. Cesta, která neexistuje nebo
+není soubor, vrátí chybu a nic se neodešle. Dohromady smějí mít nejvýše 25 MB.
+
+Soubor odejde jako MIME příloha s typem podle přípony a se jménem v kódování RFC 2231 (`filename*`, UTF-8),
+takže diakritika ve jméně zůstane. Kopie v Odeslané poště je totéž MIME, koncept v Konceptech taky
+(ukládá se jako celé MIME). Bez `attachments` se odeslání, odpověď i koncept chovají jako dřív.
+
+Odpověď drží vlákno: `In-Reply-To` a `References` a pod textem citace původní zprávy. Bez příloh citaci i vlákno
+doplní SOGo (`SmartReply`). S přílohami se zpráva složí celá tady, jméno souboru zůstane v RFC 2231 a kopie
+v Odeslané poště obsahuje přílohy.
+
 ## Omezení
 
 - Hledání umí jen předmět a odesílatele, ne text zprávy (tak hledá SOGo).
 - Skrytou kopii (Bcc) SOGo přes ActiveSync nepošle.
 - Seznam složek se načte jednou za běh; novou složku server uvidí po restartu.
 - Odesílá se z hlavní adresy účtu v SOGo (u studentů `login@students.zcu.cz`).
+- Přílohy jsou jen místní soubory serveru a dohromady nejvýše 25 MB.
 
 ## Testy
 
 - `python test_offline.py` (s nainstalovaným balíčkem): nástroje, anotace a potvrzování přes stdio, bez sítě a hesla.
-  Ověří i `ZCU_SKIP_CONFIRMATION`. Heslo ani login se nikam nevypisují.
+  Ověří i `ZCU_SKIP_CONFIRMATION` a skládání MIME s přílohou, včetně jména s diakritikou. Heslo ani login se nikam nevypisují.
 - `python3 zivy_test.py`: proti skutečné schránce, stačí Python 3.9 bez instalace. Zeptá se na login a heslo,
   vypisuje jen stavy a počty, zkušební zprávy nakonec přesune do koše.
